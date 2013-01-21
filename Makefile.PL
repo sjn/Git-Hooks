@@ -5,11 +5,6 @@ use File::Slurp;
 
 ##{ $perl_prereq ? qq[use $perl_prereq;] : ''; ##}
 
-if ($^O eq 'MSWin32') {
-    warn "I do not support Windows yet. Sorry.\n";
-    exit 0;
-}
-
 sub git {
     my ($args) = @_;
     my $output = `git $args`;
