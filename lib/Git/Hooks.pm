@@ -19,7 +19,10 @@ BEGIN {                ## no critic (Subroutines::RequireArgUnpacking)
             PRE_COMMIT PREPARE_COMMIT_MSG COMMIT_MSG
             POST_COMMIT PRE_REBASE POST_CHECKOUT POST_MERGE
             PRE_RECEIVE UPDATE POST_RECEIVE POST_UPDATE
-            PRE_AUTO_GC POST_REWRITE /;
+            PRE_AUTO_GC POST_REWRITE
+
+            GERRIT_REF_UPDATE GERRIT_PATCHSET_CREATED
+          /;
 
     for my $installer (@installers) {
         my $hook = lc $installer;
@@ -239,13 +242,104 @@ sub _prepare_update {
     return;
 }
 
+# Gerrit hooks get a list of option/value pairs. Here we convert the
+# list into a hash and change the original argument list into a single
+# hash-ref. We also record information about the user performing the
+# push. Based on:
+# http://gerrit-documentation.googlecode.com/svn/Documentation/2.5.1/cmd-index.html
+sub _prepare_gerrit_hooks {
+    my ($git, $args) = @_;
+
+    my %opt = @$args;
+
+    # The '--uploader' option comes in the form "User Name
+    # (email@example.net)" from which we simply extract the user's
+    # email.
+    if ($opt{'--uploader'} =~ /\(([^\)]+)\)/) {
+        $git->set_authenticated_user($1);
+    } else {
+        die __PACKAGE__, ": can't grok email from Gerrit uploader: '", $opt{'--uploader'}, "'.\n";
+    }
+
+    @$args = (\%opt);
+    return;
+}
+
+# The ref-update Gerrit hook is invoked when a user pushes commits to
+# a real branch, as oposed as when he pushes a commit for review in a
+# refs/for/* virtual branch. So, it acts much like Git's standard
+# 'update' hook. This routine prepares the options as usual and sets
+# the affected ref accordingly.
+
+sub _prepare_gerrit_ref_update {
+    my ($git, $args) = @_;
+
+    # ref-update --project <project name> --refname <refname>
+    # --uploader <uploader> --oldrev <sha1> --newrev <sha1>
+
+    _prepare_gerrit_hooks($git, $args);
+    $git->set_affected_ref(@{$args->[0]}{qw/--refname --oldrev --newrev/});
+    return;
+}
+
 # The %prepare_hook hash maps hook names to the routine that must be
 # invoked in order to "prepare" their arguments.
 
 my %prepare_hook = (
     'update'           => \&_prepare_update,
-    'pre-receive'  => \&_prepare_receive,
-    'post-receive' => \&_prepare_receive,
+    'pre-receive'      => \&_prepare_receive,
+    'post-receive'     => \&_prepare_receive,
+    'ref-update'       => \&_prepare_gerrit_ref_update,
+    'patchset-created' => \&_prepare_gerrit_hooks,
+);
+
+##############
+# The following routines are invoked after all hooks have been
+# processed. Some hooks may need to take a global action depending on
+# the overall result of all hooks.
+
+# Gerrit's patchset-created hook is invoked asynchronously, i.e., it
+# can't stop the push to happen. Instead, if it detects any problem,
+# we must invoke 'gerrit review' via ssh to reject the commit via
+# Gerrit's own revision process. So, in this "after hook" routine we
+# see if there were errors or not and invoke list of commands via
+# system. The commands are gathered from the
+# githooks.gerrit.patchset-created-reject-cmd and
+# githooks.gerrit.patchset-created-accept-cmd config options. One can
+# interpolate the values of any of the hook options (e.g. --project or
+# --commit) in the command strings by surrounding their names with
+# braces. For example:
+#
+# ssh githooks@gerrit gerrit review --project {--project} --verified +1 {--commit}
+# ssh githooks@gerrit gerrit review --project {--project} --verified -1 {--commit}
+
+sub _after_patchset_created {
+    my ($git, $args) = @_;
+
+    my @errors = $git->get_errors();
+
+    my @cmds = $git->get_config(
+        'githooks.gerrit',
+        @errors ? 'patchset-created-reject-cmd' : 'patchset-created-accept-cmd',
+    );
+
+    my $o = $args->[0];
+    foreach my $cmd (@cmds) {
+        # interpolate option values in command strings
+        $cmd =~ s/{(--[^}]+)}/$o->{$1}/eg;
+        # Invoke the interpolated command but don't care about its
+        # result. FIXME: I don't know what to do in thi situation yet.
+        system($cmd);
+    }
+
+    return;
+}
+
+# The %after_hook hash maps hook names to the routine that must be
+# invoked after all hooks have been processed.
+
+my %after_hook = (
+    'patchset-created' => \&_after_patchset_created,
 );
 
 ################
@@ -344,6 +438,11 @@ sub run_hook {
                     or $git->error(__PACKAGE__, ": error in external hook '$file'\n");
             }
         }
+    }
+
+    # Some hooks want to do some post-processing
+    if (my $after_hook = $after_hook{$hook_name}) {
+        $after_hook->($git, \@args);
     }
 
     die "\n" if scalar($git->get_errors());
@@ -682,6 +781,89 @@ non-specified order.
 If any of them exits abnormally, B<run_hook> dies with an appropriate
 error message.
 
+=head2 Gerrit Hooks
+
+L<Gerrit|gerrit.googlecode.com> is a web based code review and project
+management for Git based projects. It's based on
+L<JGit|http://www.eclipse.org/jgit/>, which is a pure Java
+implementation of Git.
+
+Up to version 2.2.0 JGit still doesn't support Git standard
+hooks. However, Gerrit implements its own L<special
+hooks|https://gerrit.googlesource.com/gerrit/+/master/Documentation/config-hooks.txt>.
+B<Git::Hooks> support only two of Gerrit hooks: B<ref-update> and
+B<patchset-created>.
+
+=head3 ref-update
+
+The B<ref-update> hook is executed synchronously when a user performs
+a push to a real brach and not to one of Gerrit's virtual branches
+(refs/for/*). It's purpose is the same as Git's B<update> hook and
+Git::Hooks's plugins usually support them both together.
+
+=head3 patchset-created
+
+The B<patchset-created> hook is executed asynchrounously when a user
+performs a push to one of Gerrit's virtual branches (refs/for/*) in
+order to record a new review request. This means that one cannot stop
+the request from happening just by dying inside the hook. Instead,
+what one needs to do is to invoke one of Gerrit's commands to accept
+or reject the new review request.
+
+Gerrit's commands are invoked via B<ssh> to the server. Usually, the
+review can be accepted or rejected by using the L<gerrit
+review|https://gerrit.googlesource.com/gerrit/+/master/Documentation/cmd-review.txt>
+command. You must tell Git::Hooks which commands to invoke in order to
+accept or reject reviews. Like so, for instance:
+
+    git config --add githooks.gerrit patchset-created-reject-cmd \
+      'ssh githooks@gerrit gerrit review --project {--project} --verified -1 {--commit}'
+    git config --add githooks.gerrit patchset-created-accept-cmd \
+      'ssh githooks@gerrit gerrit review --project {--project} --verified +1 {--commit}'
+
+There are a few things worth noting here:
+
+=over
+
+=item * Both configuration options can hold a list of commands. This
+is why we used the B<--add> option is important. Usually a single
+command suffices, but you may want to do other things besides marking
+the review as accepted or rejected. For instance, you may want to
+invoke L<gerrit
+set-reviewers|https://gerrit.googlesource.com/gerrit/+/master/Documentation/cmd-set-reviewers.txt>
+when accepting.
+
+=item * The commands can have hook options interpolated in them by
+surrouding the option names in braces (e.g. B<{--project}>). One can
+use any of the L<patchset-created hooks's
+options|https://gerrit.googlesource.com/gerrit/+/master/Documentation/config-hooks.txt>.
+
+=item * In the commands above we used the B<--verified> option of the
+B<gerrit review> command to accept or reject the review. This is the
+most natural way to do it but we may as well have used the
+B<--code-review> option if our Gerrit server hasn't been configured to
+allow automatic verification.
+
+=item * It goes without saying that any commands used must be
+non-interactive. In particular, the B<ssh> command should not ask for
+any kind of credentials. You must set your environment for automatic
+authentication, using non-encrypted private keys or a running ssh-agent.
+
+=item * Unfortunatelly, it's not possible for the B<gerrit review>
+command to pass more than a single line of text in the B<--message>
+option for the review "cover message". So, any error message produced
+by the hook will be lost and not get to the user. (FIXME: We have to
+ask Gerrit folks to implement a way for us to pass more information or
+to come up with an ugly hask to pass a URL to a message saved in a web
+server.)
+
+=back
+
+This hook's purpose is similar to Git's B<pre-commit> or B<commit-msg>
+hooks, in that Gerrit's verification is akin what Git's hooks allow
+one to verify locally. Git::Hooks's plugins usually support them both
+together.
+
 =head1 CONFIGURATION
 
 Git::Hooks is configured via Git's own configuration
@@ -881,6 +1063,39 @@ anchored at the start of the username.
 
 =back
 
+=head2 githooks.gerrit.enabled [01]
+
+Git hooks are specific to each repository but Gerrit hooks are unique
+for all repositories maintained by a Gerrit's instance. So, there must
+be a way to specify if a repository should use the hook or not. Gerrit
+hooks are enabled by default, but you may disable it for specific
+repositories by setting this configuration option locally to 0.
+
+=head2 githooks.gerrit.patchset-created-accept-cmd CMD
+
+Gerrit's B<patchset-created> hook is invoked asynchronously, i.e., it
+can't stop the push to happen. Instead, one must invoke the B<gerrit
+review> command via B<ssh> to signal to Gerrit if the patchset must be
+accepted or rejected.
+
+Set this option to the command that should signal that the patchset is
+accepted. For example:
+
+    git config --add githooks.gerrit.patchset-created-accept-cmd \
+      'ssh githooks@gerrit gerrit review --project {--project} --verified +1 {--commit}'
+
+Section L</Gerrit Hooks> explains this in more detail.
+
+=head2 githooks.gerrit.patchset-created-reject-cmd CMD
+
+Set this option to the command that should signal that the patchset is
+rejected. For example:
+
+    git config --add githooks.gerrit.patchset-created-reject-cmd \
+      'ssh githooks@gerrit gerrit review --project {--project} --verified -1 {--commit}'
+
+Section L</Gerrit Hooks> explains this in more detail.
+
 =head1 MAIN FUNCTION
 
 =head2 run_hook(NAME, ARGS...)
@@ -954,6 +1169,20 @@ need to implement more than one specific hook.
 =item * PRE_AUTO_GC(GIT)
 
 =item * POST_REWRITE(GIT, command)
+
+=item * GERRIT_REF_UPDATE(GIT, OPTS)
+
+This is a Gerrit non-standard hook. Gerrit invokes it passing a list
+of option/value pairs which are converted into a hash, which is passed
+by reference as the OPTS argument. For more information, please, read
+the L</Gerrit Hooks> section.
+
+=item * GERRIT_PATCHSET_CREATED(GIT, OPTS)
+
+This is a Gerrit non-standard hook. Gerrit invokes it passing a list
+of option/value pairs which are converted into a hash, which is passed
+by reference as the OPTS argument. For more information, please, read
+the L</Gerrit Hooks> section.
 
 =back
 

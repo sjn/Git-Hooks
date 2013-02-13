@@ -246,6 +246,15 @@ EOF
     return _check_jira_keys($git, $commit, $ref, @keys);
 }
 
+sub check_patchset {
+    my ($git, $opts) = @_;
+
+    my $sha1   = $opts->[0]{'--commit'};
+    my $commit = ($git->get_commits("$sha1^", $sha1))[-1];
+
+    return check_commit_msg($git, $commit, $opts->[0]{'--branch'});
+}
+
 sub check_message_file {
     my ($git, $commit_msg_file) = @_;
 
@@ -311,7 +320,8 @@ sub check_affected_refs {
 COMMIT_MSG  \&check_message_file;
 UPDATE      \&check_affected_refs;
 PRE_RECEIVE \&check_affected_refs;
-
+GERRIT_REF_UPDATE \&check_affected_refs;
+GERRIT_PATCHSET_CREATED \&check_patchset;
 1;
 
 
@@ -347,6 +357,18 @@ message cites valid JIRA issues.
 
 This hook is invoked once in the remote repository during C<git push>,
 to check if the commit message cites valid JIRA issues.
+
+=item * B<ref-update>
+
+This hook is invoked when a push request is received by Gerrit Code
+Review for a real branch, to check if the commit message cites valid
+JIRA issues.
+
+=item * B<patchset-created>
+
+This hook is invoked when a push request is received by Gerrit Code
+Review for a virtual branch (refs/for/*), to check if the commit
+message cites valid JIRA issues.
 
 =back
 

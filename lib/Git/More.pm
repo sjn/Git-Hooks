@@ -134,6 +134,7 @@ sub get_config {
 
         # Set default values for undefined ones.
         $config{githooks}{externals} //= [1];
+        $config{githooksgerrit}{enabled} //= [1];
 
         _compatibilize_config(\%config);
 
